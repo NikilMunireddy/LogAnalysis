@@ -5,7 +5,6 @@ from langchain_core.documents import Document
 from langchain.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 import tempfile
-import ollama
 import os
 import re
 import psycopg2
@@ -14,15 +13,27 @@ import pandas as pd
 from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
+import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
 
 # --- Setup ---
-st.set_page_config(page_title="DeepSeek & Ollama + Log Analysis", layout="wide")
-st.title("📚 Database Log Analysis")
+st.set_page_config(page_title="DeepSeek & Gemini + Log Analysis", layout="wide")
+st.title("📚 Database Log Analysis with Gemini")
 
 VECTORSTORE_DIR = "."
 INDEX_NAME = "faiss_index"
 embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-MODEL_NAME = "llama3:latest"
+
+# Initialize Gemini
+if "gemini_model" not in st.session_state:
+    try:
+        # Configure Gemini - you'll need to set GOOGLE_API_KEY in your environment
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+        st.session_state.gemini_model = genai.GenerativeModel('gemini-pro')
+        st.success("✅ Gemini model initialized successfully!")
+    except Exception as e:
+        st.error(f"❌ Failed to initialize Gemini: {e}")
+        st.session_state.gemini_model = None
 
 # Initialize chat history in Streamlit session state
 if "chat_history" not in st.session_state:
@@ -328,9 +339,38 @@ def import_log_file(file):
         st.error(f"Error importing log file: {e}")
         return False
 
+def query_gemini(prompt, context=""):
+    """Query Gemini model with error handling"""
+    if st.session_state.gemini_model is None:
+        return "❌ Gemini model is not available. Please check your API key configuration."
+    
+    try:
+        full_prompt = f"{context}\n\n{prompt}" if context else prompt
+        response = st.session_state.gemini_model.generate_content(full_prompt)
+        return response.text
+    except google_exceptions.InvalidArgument as e:
+        return f"❌ Invalid argument error: {e}"
+    except google_exceptions.PermissionDenied as e:
+        return f"❌ Permission denied: {e}"
+    except google_exceptions.ResourceExhausted as e:
+        return f"❌ API quota exceeded: {e}"
+    except Exception as e:
+        return f"❌ Error querying Gemini: {e}"
+
 # --- Sidebar for Database Configuration ---
 with st.sidebar:
     st.header("🔧 Configuration")
+    
+    st.subheader("AI Model Configuration")
+    api_key = st.text_input("Google API Key", type="password", 
+                           help="Enter your Google AI Studio API key")
+    if api_key:
+        try:
+            genai.configure(api_key=api_key)
+            st.session_state.gemini_model = genai.GenerativeModel('gemini-pro')
+            st.success("✅ Gemini configured successfully!")
+        except Exception as e:
+            st.error(f"❌ Failed to configure Gemini: {e}")
     
     st.subheader("Database Type")
     db_type = st.radio("Select Database", ["sqlite", "postgres"], 
@@ -378,11 +418,11 @@ with st.sidebar:
             st.error("❌ Failed to import log file")
 
 # --- Main Tabs ---
-tab1, tab2, tab3 = st.tabs(["📚 Document RAG", "📊 Log Analysis", "🤖 AI Log Insights"])
+tab1, tab2, tab3 = st.tabs(["📚 Document RAG with Gemini", "📊 Log Analysis", "🤖 AI Log Insights"])
 
 with tab1:
-    # --- Document RAG Section for Log Analysis ---
-    st.header("🔍 Log File Analysis for Microservice RCA")
+    # --- Document RAG Section for Log Analysis with Gemini ---
+    st.header("🔍 Log File Analysis for Microservice RCA with Gemini")
     
     # Try to load persisted index
     index_path = os.path.join(VECTORSTORE_DIR, INDEX_NAME)
@@ -462,23 +502,26 @@ with tab1:
         height=100
     )
 
-    if st.button("🚀 Analyze Logs") and query and vectorstore:
-        with st.spinner("🔎 Analyzing logs for root causes..."):
-            # Perform similarity search
-            docs = vectorstore.similarity_search(query, k=5)
-            
-            if not docs:
-                answer = "❌ I couldn't find any relevant log entries matching your query. Please try different search terms or upload more log files."
-                st.session_state.chat_history.append({"role": "user", "content": query})
-                st.session_state.chat_history.append({"role": "assistant", "content": answer})
-            else:
-                # Build context from relevant log entries
-                context = "\n\n--- LOG ENTRIES ---\n"
-                for i, doc in enumerate(docs, 1):
-                    context += f"\n[ENTRY {i}]:\n{doc.page_content}\n"
+    if st.button("🚀 Analyze Logs with Gemini") and query and vectorstore:
+        if st.session_state.gemini_model is None:
+            st.error("❌ Please configure Gemini API key in the sidebar first.")
+        else:
+            with st.spinner("🔎 Analyzing logs for root causes with Gemini..."):
+                # Perform similarity search
+                docs = vectorstore.similarity_search(query, k=5)
                 
-                # Enhanced system prompt for RCA analysis
-                system_prompt = """
+                if not docs:
+                    answer = "❌ I couldn't find any relevant log entries matching your query. Please try different search terms or upload more log files."
+                    st.session_state.chat_history.append({"role": "user", "content": query})
+                    st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                else:
+                    # Build context from relevant log entries
+                    context = "\n\n--- LOG ENTRIES ---\n"
+                    for i, doc in enumerate(docs, 1):
+                        context += f"\n[ENTRY {i}]:\n{doc.page_content}\n"
+                    
+                    # Enhanced system prompt for RCA analysis
+                    system_prompt = """
 You are an expert Site Reliability Engineer (SRE) and DevOps specialist specializing in microservice architecture and log analysis. Your task is to perform Root Cause Analysis (RCA) and provide actionable insights.
 
 ANALYSIS FRAMEWORK:
@@ -505,48 +548,38 @@ FORMAT REQUIREMENTS:
 
 If the logs don't contain enough information, be honest about limitations and suggest what additional logging would help.
 """
+                    # Enhanced query with structured context
+                    enhanced_query = f"""
+Based on the following log entries and analysis request, please provide a comprehensive Root Cause Analysis:
 
-                # Build conversation history
-                messages = [{"role": "system", "content": system_prompt}]
-                for msg in st.session_state.chat_history[-6:]:  # Keep recent history
-                    messages.append(msg)
-                
-                # Enhanced query with structured context
-                enhanced_query = f"""
-LOGS ANALYSIS REQUEST: {query}
+ANALYSIS REQUEST: {query}
 
-RELEVANT LOG ENTRIES FOUND:
+RELEVANT LOG ENTRIES:
 {context}
 
-ANALYSIS REQUIREMENTS:
-1. Perform detailed Root Cause Analysis
-2. Provide specific evidence from the logs above
-3. Suggest immediate and long-term fixes
-4. Prioritize recommendations by impact
-5. Include relevant error codes, timestamps, and patterns
+Please provide a structured analysis following this format:
+1. **Problem Summary**: Brief overview of the main issue
+2. **Key Findings**: Specific evidence from the logs
+3. **Root Cause Analysis**: Underlying causes identified
+4. **Immediate Actions**: Short-term fixes to implement now
+5. **Long-term Solutions**: Architectural improvements
+6. **Monitoring Recommendations**: What to watch for in the future
 
-Please provide a comprehensive analysis:
+Be specific and reference the actual log entries in your analysis.
 """
-                messages.append({"role": "user", "content": enhanced_query})
-                
-                try:
-                    response = ollama.chat(
-                        model=MODEL_NAME,
-                        messages=messages
-                    )
-                    raw_answer = response['message']['content']
                     
-                    # Clean up the response
-                    cleaned_answer = re.sub(r"<think>.*?</think>", "", raw_answer, flags=re.DOTALL).strip()
-                    
-                    # Append to session history
-                    st.session_state.chat_history.append({"role": "user", "content": query})
-                    st.session_state.chat_history.append({"role": "assistant", "content": cleaned_answer})
-                    
-                except Exception as e:
-                    cleaned_answer = f"💥 Failed to analyze logs: {str(e)}"
-                    st.session_state.chat_history.append({"role": "user", "content": query})
-                    st.session_state.chat_history.append({"role": "assistant", "content": cleaned_answer})
+                    try:
+                        # Use Gemini for analysis
+                        response = query_gemini(enhanced_query, system_prompt)
+                        
+                        # Append to session history
+                        st.session_state.chat_history.append({"role": "user", "content": query})
+                        st.session_state.chat_history.append({"role": "assistant", "content": response})
+                        
+                    except Exception as e:
+                        error_msg = f"💥 Failed to analyze logs with Gemini: {str(e)}"
+                        st.session_state.chat_history.append({"role": "user", "content": query})
+                        st.session_state.chat_history.append({"role": "assistant", "content": error_msg})
 
     # Display analysis results
     if vectorstore:
@@ -614,7 +647,7 @@ Please provide a comprehensive analysis:
                 if st.button("🗑️ Delete", key=f"delete_{insight['timestamp'].timestamp()}"):
                     st.session_state.saved_insights.remove(insight)
                     st.rerun()
-                    
+
 with tab2:
     # --- Log Analysis Section ---
     st.header(f"{'SQLite' if st.session_state.db_config['db_type'] == 'sqlite' else 'PostgreSQL'} Log Analysis Dashboard")
@@ -729,51 +762,50 @@ with tab2:
         st.error("Please configure and connect to database in the sidebar.")
 
 with tab3:
-    # --- AI Log Insights Section ---
-    st.header("🤖 AI-Powered Log Insights")
+    # --- AI Log Insights Section with Gemini ---
+    st.header("🤖 AI-Powered Log Insights with Gemini")
     
     conn = connect_to_database()
     if conn:
         st.subheader("AI Analysis of Log Data")
         
-        if st.button("Generate AI Insights"):
-            with st.spinner("Analyzing logs with AI..."):
-                log_context = generate_log_insights(conn, days=7)
-                
-                system_prompt = """
-You are an experienced DevOps engineer and log analysis expert. Analyze the provided log data and provide:
-1. Key insights and patterns
-2. Potential issues or anomalies
-3. Recommendations for improvement
-4. Security concerns if any
+        if st.button("Generate AI Insights with Gemini"):
+            if st.session_state.gemini_model is None:
+                st.error("❌ Please configure Gemini API key in the sidebar first.")
+            else:
+                with st.spinner("Analyzing logs with Gemini..."):
+                    log_context = generate_log_insights(conn, days=7)
+                    
+                    analysis_prompt = f"""
+As an experienced DevOps engineer and log analysis expert, analyze the following log data and provide:
 
-Be concise but thorough in your analysis.
+1. **Key Insights and Patterns**: Identify main trends and anomalies
+2. **Potential Issues**: Highlight any concerning patterns or errors
+3. **Performance Analysis**: Evaluate response times and service performance
+4. **Recommendations**: Provide actionable improvement suggestions
+5. **Security Concerns**: Identify any potential security issues
+
+Log Data Summary:
+{log_context}
+
+Please provide a comprehensive but concise analysis with specific recommendations.
 """
-                
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Please analyze this log data:\n\n{log_context}"}
-                ]
-                
-                try:
-                    response = ollama.chat(
-                        model=MODEL_NAME,
-                        messages=messages
-                    )
-                    insights = response['message']['content']
-                    st.subheader("AI Insights")
-                    st.write(insights)
                     
-                    # Save insights to session state
-                    if "log_insights" not in st.session_state:
-                        st.session_state.log_insights = []
-                    st.session_state.log_insights.append({
-                        "timestamp": datetime.now(),
-                        "insights": insights
-                    })
-                    
-                except Exception as e:
-                    st.error(f"Failed to generate AI insights: {str(e)}")
+                    try:
+                        insights = query_gemini(analysis_prompt)
+                        st.subheader("AI Insights from Gemini")
+                        st.write(insights)
+                        
+                        # Save insights to session state
+                        if "log_insights" not in st.session_state:
+                            st.session_state.log_insights = []
+                        st.session_state.log_insights.append({
+                            "timestamp": datetime.now(),
+                            "insights": insights
+                        })
+                        
+                    except Exception as e:
+                        st.error(f"Failed to generate AI insights: {str(e)}")
         
         # Display previous insights
         if "log_insights" in st.session_state and st.session_state.log_insights:
